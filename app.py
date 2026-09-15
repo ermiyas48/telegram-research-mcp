@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Telegram Research Access Service - MTProto Telethon REST API"""
+"""Telegram Research Access Service - MTProto Telethon REST API for agents"""
 import os, asyncio, logging
 from datetime import datetime, timezone
 from typing import Optional, Dict
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, User, Channel, Chat
-from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, ChannelInvalidError, SessionPasswordNeededError
+from telethon.tl.types import User, Channel, Chat
+from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, ChannelInvalidError
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "37261813"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "4910f18f0d2a51ea977aabff59941644")
@@ -96,7 +96,7 @@ async def serialize_message(cl, msg, download_media=False):
     except Exception: pass
     media_info = None
     if msg.media:
-        media_info = {"type": type(msg.media).__name__, "available": False}
+        media_info = {"type": type(msg.media).__name__, "available": False, "has_media": True}
         if download_media:
             try:
                 fname = f"{msg.chat_id}_{msg.id}"
@@ -135,7 +135,43 @@ async def lifespan(app: FastAPI):
     if client and client.is_connected():
         await client.disconnect()
 
-app = FastAPI(title="Telegram Research Access Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Telegram Research Access Service", version="1.1.0", lifespan=lifespan)
+
+CATALOG = {
+    "service": "Telegram Research Access Service",
+    "source": "telegram_mtproto",
+    "auth": "none when ALLOW_NO_AUTH=1",
+    "how_agents_use": "Plain HTTP GET. No MCP required. Parse JSON response.",
+    "base_url_hint": "Use the public Railway URL for this deployment",
+    "tools": [
+        {"name": "health", "method": "GET", "path": "/health", "description": "Session health and authorized user"},
+        {"name": "me", "method": "GET", "path": "/telegram/me", "description": "Logged-in account profile"},
+        {"name": "dialogs", "method": "GET", "path": "/telegram/dialogs?limit=30", "description": "List chats/channels/groups this account can access"},
+        {"name": "history", "method": "GET", "path": "/telegram?target=@channel&limit=50", "description": "Message history; optional before/after message ids"},
+        {"name": "search", "method": "GET", "path": "/telegram/search?target=@channel&q=keyword", "description": "Keyword search in a chat"},
+        {"name": "message", "method": "GET", "path": "/telegram/message?target=@channel&message_id=123", "description": "Single message by id"},
+        {"name": "media", "method": "GET", "path": "/telegram/media?target=@channel&message_id=123&download=true", "description": "Download media and return path/url"},
+        {"name": "media_file", "method": "GET", "path": "/telegram/media/file?path=FILENAME", "description": "Fetch previously downloaded file bytes"},
+        {"name": "updates", "method": "GET", "path": "/telegram/updates?target=@channel&cursor=123", "description": "Incremental messages after cursor"},
+    ],
+    "examples": [
+        "/telegram?target=@pir2011&limit=20",
+        "/telegram/search?target=@pir2011&q=registration",
+        "/telegram/dialogs?limit=20",
+        "/telegram/me",
+    ],
+    "not_included": ["delete messages", "ban users", "join arbitrary private invites without care", "export full session string"],
+}
+
+@app.get("/")
+async def root(format: Optional[str] = Query(None)):
+    if format == "html":
+        lines = ["<h1>Telegram Research API</h1>", "<p>Plain HTTP for agents. No MCP.</p>", "<ul>"]
+        for t in CATALOG["tools"]:
+            lines.append(f"<li><b>{t['name']}</b> — <code>{t['method']} {t['path']}</code><br/>{t['description']}</li>")
+        lines.append("</ul>")
+        return HTMLResponse("\n".join(lines))
+    return CATALOG
 
 @app.get("/health")
 async def health():
@@ -146,6 +182,34 @@ async def health():
         return {"ok": True, "status": "healthy", "source": "telegram_mtproto", "authorized": authorized, "user_id": me.id if me else None, "username": me.username if me else None, "timestamp": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
         return JSONResponse(status_code=503, content={"ok": False, "status": "unhealthy", "error": str(e)})
+
+@app.get("/telegram/me")
+async def telegram_me(api_key: str = Depends(require_api_key)):
+    try:
+        cl = await get_client()
+        me = await cl.get_me()
+        return {"ok": True, "source": "telegram_mtproto", "user": {"id": me.id, "username": me.username, "first_name": me.first_name, "last_name": me.last_name, "phone": getattr(me, "phone", None)}}
+    except Exception as e:
+        return error_response("TEMPORARY_ERROR", str(e), 500)
+
+@app.get("/telegram/dialogs")
+async def telegram_dialogs(limit: int = Query(30, ge=1, le=100), api_key: str = Depends(require_api_key)):
+    try:
+        cl = await get_client()
+        dialogs = []
+        async for d in cl.iter_dialogs(limit=limit):
+            dialogs.append({
+                "id": d.id,
+                "title": d.title or d.name,
+                "username": getattr(d.entity, "username", None),
+                "unread": d.unread_count,
+                "is_channel": d.is_channel,
+                "is_group": d.is_group,
+                "is_user": d.is_user,
+            })
+        return {"ok": True, "source": "telegram_mtproto", "count": len(dialogs), "dialogs": dialogs}
+    except Exception as e:
+        return error_response("TEMPORARY_ERROR", str(e), 500)
 
 @app.get("/telegram")
 async def get_history(target: str = Query(...), limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT), offset_id: int = Query(0), min_id: int = Query(0), max_id: int = Query(0), before: Optional[int] = Query(None), after: Optional[int] = Query(None), reverse: bool = Query(False), download_media: bool = Query(False), api_key: str = Depends(require_api_key)):
@@ -238,10 +302,6 @@ async def get_updates(target: str = Query(...), cursor: Optional[int] = Query(No
         return {"ok": True, "source": "telegram_mtproto", "target": target, "chat_id": chat_id, "cursor": last_id, "next_cursor": new_cursor, "count": len(messages), "messages": messages, "has_more": len(messages) == limit}
     except Exception as e:
         return error_response("TEMPORARY_ERROR", str(e), 500)
-
-@app.get("/")
-async def root():
-    return {"service": "Telegram Research Access Service", "source": "telegram_mtproto", "endpoints": ["/health", "/telegram", "/telegram/search", "/telegram/message", "/telegram/media", "/telegram/updates"], "auth": "none when ALLOW_NO_AUTH=1"}
 
 if __name__ == "__main__":
     import uvicorn
