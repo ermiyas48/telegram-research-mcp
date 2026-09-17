@@ -44,20 +44,12 @@ async def get_client() -> TelegramClient:
                 log.info("Telethon client connected")
     return client
 
-async def require_api_key(
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    api_key: Optional[str] = Query(None, description="API key / password alias"),
-    password: Optional[str] = Query(None, description="Password preferred for agents"),
-):
+async def require_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key"), api_key: Optional[str] = Query(None), password: Optional[str] = Query(None)):
     if os.getenv("ALLOW_NO_AUTH", "0") == "1":
         return "open"
     key = password or api_key or x_api_key
     if not key or key != API_KEY:
-        raise HTTPException(status_code=401, detail={
-            "ok": False,
-            "error": "UNAUTHORIZED",
-            "message": "Valid password required. Add ?password=YOUR_PASSWORD"
-        })
+        raise HTTPException(status_code=401, detail={"ok": False, "error": "UNAUTHORIZED"})
     return key
 
 def error_response(code: str, message: str, status: int = 400, **extra):
@@ -174,7 +166,7 @@ CATALOG = {
 @app.get("/")
 async def root(format: Optional[str] = Query(None)):
     if format == "html":
-        lines = ["<h1>Telegram Research API</h1>", "<p>Plain HTTP for agents. Type name then password=?password=SECRET. No browser needed.</p>", "<ul>"]
+        lines = ["<h1>Telegram Research API</h1>", "<p>Plain HTTP for agents. No MCP.</p>", "<ul>"]
         for t in CATALOG["tools"]:
             lines.append(f"<li><b>{t['name']}</b> — <code>{t['method']} {t['path']}</code><br/>{t['description']}</li>")
         lines.append("</ul>")
@@ -308,6 +300,111 @@ async def get_updates(target: str = Query(...), cursor: Optional[int] = Query(No
             new_cursor = max(m["message_id"] for m in messages)
             checkpoints[chat_id] = new_cursor
         return {"ok": True, "source": "telegram_mtproto", "target": target, "chat_id": chat_id, "cursor": last_id, "next_cursor": new_cursor, "count": len(messages), "messages": messages, "has_more": len(messages) == limit}
+    except Exception as e:
+        return error_response("TEMPORARY_ERROR", str(e), 500)
+
+
+
+# === ERMI extended: dialogs with last_message, find_media, send ===
+from pydantic import BaseModel, Field
+from typing import Any
+
+@app.get("/telegram/me")
+@app.get("/me")
+async def get_me_v2(api_key: str = Depends(require_api_key)):
+    try:
+        cl = await get_client()
+        me = await cl.get_me()
+        return {"ok": True, "source": "telegram_mtproto", "user": {"id": me.id, "username": me.username, "first_name": me.first_name, "last_name": me.last_name, "phone": getattr(me, "phone", None)}}
+    except Exception as e:
+        return error_response("TEMPORARY_ERROR", str(e), 500)
+
+@app.get("/telegram/dialogs")
+async def list_dialogs_v2(limit: int = Query(40, ge=1, le=200), api_key: str = Depends(require_api_key)):
+    try:
+        cl = await get_client()
+        dialogs = []
+        async for d in cl.iter_dialogs(limit=limit):
+            ent = d.entity
+            last = d.message
+            last_preview = None
+            if last:
+                media_type = None
+                if last.media:
+                    from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+                    if isinstance(last.media, MessageMediaPhoto):
+                        media_type = "photo"
+                    elif isinstance(last.media, MessageMediaDocument) and last.document:
+                        mt = last.document.mime_type or ""
+                        media_type = "video" if mt.startswith("video/") else ("image" if mt.startswith("image/") else ("audio" if mt.startswith("audio/") else "document"))
+                    else:
+                        media_type = type(last.media).__name__
+                last_preview = {"message_id": last.id, "date": last.date.isoformat() if last.date else None, "text": ((last.text or last.message or "")[:200] or None), "has_media": bool(last.media), "media_type": media_type}
+            username = getattr(ent, "username", None)
+            title = getattr(ent, "title", None) or " ".join(filter(None, [getattr(ent, "first_name", None), getattr(ent, "last_name", None)])) or username or str(ent.id)
+            from telethon.tl.types import Channel, Chat, User
+            dialogs.append({"id": ent.id, "title": title, "username": username, "unread": d.unread_count, "is_channel": isinstance(ent, Channel) and not getattr(ent, "megagroup", False), "is_group": isinstance(ent, Chat) or (isinstance(ent, Channel) and getattr(ent, "megagroup", False)), "is_user": isinstance(ent, User), "is_bot": bool(getattr(ent, "bot", False)), "target": ("@" + username) if username else str(ent.id), "last_message": last_preview})
+        return {"ok": True, "source": "telegram_mtproto", "count": len(dialogs), "dialogs": dialogs, "hint": "Use target= dialog.target or dialog.id for history/search/media. last_message shows recent text/photo."}
+    except Exception as e:
+        return error_response("TEMPORARY_ERROR", str(e), 500)
+
+@app.get("/telegram/find_media")
+async def find_media_v2(target: str = Query(...), limit: int = Query(30, ge=1, le=100), media_type: str = Query(None), q: str = Query(None), download: bool = Query(False), api_key: str = Depends(require_api_key)):
+    try:
+        cl = await get_client()
+        entity = await resolve_target(cl, target)
+        want = (media_type or "").lower().strip() or None
+        results = []
+        kwargs = {"limit": min(max(limit * 4, 50), 200)}
+        if q:
+            kwargs["search"] = q
+        async for msg in cl.iter_messages(entity, **kwargs):
+            if not msg.media:
+                continue
+            info = await serialize_media(cl, msg, download=False) if "serialize_media" in dir() else None
+            mtype = (info or {}).get("type") if info else None
+            if not mtype:
+                from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+                if isinstance(msg.media, MessageMediaPhoto):
+                    mtype = "photo"
+                elif isinstance(msg.media, MessageMediaDocument) and msg.document:
+                    mt = msg.document.mime_type or ""
+                    mtype = "video" if mt.startswith("video/") else ("image" if mt.startswith("image/") else "document")
+                else:
+                    mtype = "media"
+            if want and want not in (mtype or "").lower():
+                continue
+            if "serialize_message" in dir():
+                results.append(await serialize_message(cl, msg, include_media=True, download_media=download))
+            else:
+                results.append({"message_id": msg.id, "text": msg.text, "date": msg.date.isoformat() if msg.date else None, "media_type": mtype})
+            if len(results) >= limit:
+                break
+        return {"ok": True, "source": "telegram_mtproto", "target": target, "count": len(results), "messages": results, "hint": "Then GET /telegram/media?target=...&message_id=ID&download=true&password=..."}
+    except Exception as e:
+        return error_response("TEMPORARY_ERROR", str(e), 500)
+
+class SendBody(BaseModel):
+    target: str
+    text: str
+    reply_to: int = None
+
+@app.post("/telegram/send")
+async def send_message_v2(body: SendBody, password: str = Query(None), api_key: str = Query(None), x_api_key: str = Header(None, alias="X-API-Key")):
+    import os
+    if os.getenv("ALLOW_NO_AUTH", "0") != "1":
+        key = password or api_key or x_api_key
+        if not key or key != API_KEY:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail={"ok": False, "error": "UNAUTHORIZED", "message": "Valid password required"})
+    try:
+        cl = await get_client()
+        entity = await resolve_target(cl, body.target)
+        kwargs = {}
+        if body.reply_to:
+            kwargs["reply_to"] = body.reply_to
+        msg = await cl.send_message(entity, body.text, **kwargs)
+        return {"ok": True, "source": "telegram_mtproto", "action": "sent", "target": body.target, "message_id": msg.id, "text": msg.text, "date": msg.date.isoformat() if msg.date else None}
     except Exception as e:
         return error_response("TEMPORARY_ERROR", str(e), 500)
 
