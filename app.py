@@ -16,16 +16,6 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "37261813"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "4910f18f0d2a51ea977aabff59941644")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION", "")
 API_KEY = os.getenv("ERMI_API_KEY", "ermi-research-key-change-me")
-
-# Bot API delivery + control (env only)
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CONTROL_BOT_ENABLED = os.getenv("CONTROL_BOT_ENABLED", "1") == "1"
-CONTROL_BOT_ALLOWED_IDS = {int(x.strip()) for x in os.getenv("CONTROL_BOT_ALLOWED_IDS", "6725547584").split(",") if x.strip().isdigit()}
-DEFAULT_DELIVER_CHAT_ID = int(os.getenv("DEFAULT_DELIVER_CHAT_ID", "6725547584"))
-BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
-_control_bot_task = None
-_control_bot_offset = 0
-
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "./media_cache"))
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 MAX_LIMIT = 500
@@ -144,13 +134,6 @@ async def lifespan(app: FastAPI):
     yield
     if client and client.is_connected():
         await client.disconnect()
-
-@app.on_event("startup")
-async def _start_control_bot():
-    global _control_bot_task
-    if CONTROL_BOT_ENABLED and BOT_TOKEN:
-        _control_bot_task = asyncio.create_task(_control_bot_loop())
-        log.info("Control bot task scheduled")
 
 app = FastAPI(title="Telegram Research Access Service", version="1.1.0", lifespan=lifespan)
 
@@ -424,128 +407,6 @@ async def send_message_v2(body: SendBody, password: str = Query(None), api_key: 
         return {"ok": True, "source": "telegram_mtproto", "action": "sent", "target": body.target, "message_id": msg.id, "text": msg.text, "date": msg.date.isoformat() if msg.date else None}
     except Exception as e:
         return error_response("TEMPORARY_ERROR", str(e), 500)
-
-
-import httpx
-from pydantic import BaseModel, Field
-
-async def bot_api(method: str, data=None, files=None, timeout: float = 30.0):
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN not configured")
-    url = f"{BOT_API}/{method}"
-    async with httpx.AsyncClient(timeout=timeout) as hx:
-        if files:
-            r = await hx.post(url, data=data or {}, files=files)
-        else:
-            r = await hx.post(url, json=data or {})
-        return r.json()
-
-def _auth_password(password=None, api_key=None, x_api_key=None):
-    if os.getenv("ALLOW_NO_AUTH", "0") == "1":
-        return
-    key = password or api_key or x_api_key
-    if not key or key != API_KEY:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=401, detail={"ok": False, "error": "UNAUTHORIZED", "message": "Valid password required"})
-
-class DeliverBody(BaseModel):
-    text: str = None
-    chat_id: int = None
-    document_url: str = None
-    caption: str = None
-    parse_mode: str = None
-
-@app.get("/telegram/bot")
-async def bot_status(api_key: str = Depends(require_api_key)):
-    if not BOT_TOKEN:
-        return {"ok": False, "bot_configured": False}
-    try:
-        data = await bot_api("getMe")
-        result = data.get("result") or {}
-        return {"ok": bool(data.get("ok")), "bot_configured": True, "bot": {"id": result.get("id"), "username": result.get("username"), "first_name": result.get("first_name")}, "default_deliver_chat_id": DEFAULT_DELIVER_CHAT_ID, "control_bot_enabled": CONTROL_BOT_ENABLED}
-    except Exception as e:
-        return error_response("BOT_ERROR", str(e), 500)
-
-@app.post("/telegram/deliver")
-async def deliver_message(body: DeliverBody, password: str = Query(None), api_key: str = Query(None), x_api_key: str = Header(None, alias="X-API-Key")):
-    _auth_password(password, api_key, x_api_key)
-    if not BOT_TOKEN:
-        return error_response("BOT_NOT_CONFIGURED", "TELEGRAM_BOT_TOKEN missing", 503)
-    if not body.text and not body.document_url:
-        return error_response("BAD_REQUEST", "Provide text and/or document_url", 400)
-    chat_id = body.chat_id or DEFAULT_DELIVER_CHAT_ID
-    delivered = []
-    try:
-        if body.text:
-            payload = {"chat_id": chat_id, "text": body.text}
-            if body.parse_mode:
-                payload["parse_mode"] = body.parse_mode
-            data = await bot_api("sendMessage", payload)
-            if not data.get("ok"):
-                return error_response("DELIVER_FAILED", data.get("description", "sendMessage failed"), 502)
-            msg = data["result"]
-            delivered.append({"type": "text", "message_id": msg.get("message_id"), "chat_id": (msg.get("chat") or {}).get("id"), "date": msg.get("date")})
-        if body.document_url:
-            payload = {"chat_id": chat_id, "document": body.document_url}
-            if body.caption:
-                payload["caption"] = body.caption
-            data = await bot_api("sendDocument", payload)
-            if not data.get("ok"):
-                return error_response("DELIVER_FAILED", data.get("description", "sendDocument failed"), 502)
-            msg = data["result"]
-            delivered.append({"type": "document", "message_id": msg.get("message_id"), "chat_id": (msg.get("chat") or {}).get("id"), "date": msg.get("date")})
-        return {"ok": True, "source": "telegram_bot_api", "action": "delivered", "chat_id": chat_id, "count": len(delivered), "messages": delivered}
-    except Exception as e:
-        return error_response("TEMPORARY_ERROR", str(e), 500)
-
-async def _control_bot_loop():
-    global _control_bot_offset
-    while True:
-        try:
-            if not BOT_TOKEN:
-                await asyncio.sleep(30)
-                continue
-            data = await bot_api("getUpdates", {"offset": _control_bot_offset, "timeout": 25, "allowed_updates": ["message"]}, timeout=35.0)
-            if not data.get("ok"):
-                await asyncio.sleep(5)
-                continue
-            for upd in data.get("result") or []:
-                _control_bot_offset = max(_control_bot_offset, int(upd.get("update_id", 0)) + 1)
-                msg = upd.get("message") or {}
-                from_user = msg.get("from") or {}
-                uid = from_user.get("id")
-                text = (msg.get("text") or "").strip()
-                chat_id = (msg.get("chat") or {}).get("id")
-                if not text or not uid or not chat_id:
-                    continue
-                if uid not in CONTROL_BOT_ALLOWED_IDS:
-                    try:
-                        await bot_api("sendMessage", {"chat_id": chat_id, "text": "Unauthorized."})
-                    except Exception:
-                        pass
-                    continue
-                cmd = text.split()[0].split("@")[0].lower()
-                reply = None
-                if cmd in ("/start", "/help"):
-                    reply = "ERMI Control Bot\n/help /status /ping\nAgents: POST /telegram/deliver"
-                elif cmd == "/ping":
-                    reply = "pong"
-                elif cmd == "/status":
-                    try:
-                        cl = await get_client()
-                        me = await cl.get_me()
-                        reply = f"ok mtproto=@{me.username} id={me.id} deliver_chat={DEFAULT_DELIVER_CHAT_ID}"
-                    except Exception as e:
-                        reply = f"status error: {type(e).__name__}"
-                else:
-                    reply = "Unknown. Allowed: /help /status /ping"
-                if reply:
-                    await bot_api("sendMessage", {"chat_id": chat_id, "text": reply})
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning("control bot error: %s", e)
-            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     import uvicorn
